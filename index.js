@@ -68,9 +68,22 @@ function getCurrentClans() {
 }
 
 // ================= CLAN XP STORAGE SYSTEM =================
-// Railway Volume: يحفظ البيانات داخل المسار الذي توفره Railway تلقائياً.
-// محلياً: نستعمل ./data كـ fallback.
-const volumeMountPath = process.env.RAILWAY_VOLUME_MOUNT_PATH || path.join(__dirname, "data");
+// Railway Volume: نستعمل المسار الذي توفره Railway، مع /app/data كمسار افتراضي
+// حتى لا نتوقف فقط لأن متغير RAILWAY_VOLUME_MOUNT_PATH غير ظاهر.
+// لا يتم قبول /app/data على Railway إلا بعد التأكد أنه Mount Point فعلي.
+const DEFAULT_RAILWAY_VOLUME_MOUNT_PATH = "/app/data";
+const isRailwayRuntime = Boolean(
+    process.env.RAILWAY_PROJECT_ID ||
+    process.env.RAILWAY_SERVICE_ID ||
+    process.env.RAILWAY_DEPLOYMENT_ID ||
+    process.env.RAILWAY_VOLUME_NAME ||
+    process.env.RAILWAY_VOLUME_MOUNT_PATH
+);
+
+const volumeMountPath = isRailwayRuntime
+    ? (process.env.RAILWAY_VOLUME_MOUNT_PATH || DEFAULT_RAILWAY_VOLUME_MOUNT_PATH)
+    : path.join(__dirname, "data");
+
 const xpStorageDir = volumeMountPath;
 const clansXPPath = path.join(xpStorageDir, "clansXP.json");
 const clansXPBackupPath = path.join(xpStorageDir, "clansXP.json.bak");
@@ -107,15 +120,6 @@ function isActualMountPoint(mountPath) {
 }
 
 function verifyXPVolumeBeforeBotStart() {
-    const railwayVolumePath = process.env.RAILWAY_VOLUME_MOUNT_PATH;
-    const isRailwayRuntime = Boolean(
-        process.env.RAILWAY_PROJECT_ID ||
-        process.env.RAILWAY_SERVICE_ID ||
-        process.env.RAILWAY_DEPLOYMENT_ID ||
-        process.env.RAILWAY_VOLUME_NAME ||
-        railwayVolumePath
-    );
-
     console.log("==================================================");
     console.log("📦 Clan XP Storage Startup Check");
     console.log(`📄 clansXP.json path: ${clansXPPath}`);
@@ -127,23 +131,23 @@ function verifyXPVolumeBeforeBotStart() {
         return true;
     }
 
-    if (!railwayVolumePath) {
-        console.error("❌ Railway runtime detected, but RAILWAY_VOLUME_MOUNT_PATH is missing.");
+    const railwayVolumePath = volumeMountPath;
+    const envMountPath = process.env.RAILWAY_VOLUME_MOUNT_PATH || "(not provided)";
+
+    console.log(`📦 Railway Volume env mount path: ${envMountPath}`);
+    console.log(`📦 Volume path being checked: ${railwayVolumePath}`);
+
+    if (!fs.existsSync(railwayVolumePath)) {
+        console.error(`❌ Volume path does not exist: ${railwayVolumePath}`);
+        console.error("❌ Attach a Railway Volume to THIS service and set Mount Path to /app/data.");
         console.error("❌ The bot will NOT start to prevent saving XP on ephemeral storage.");
         return false;
     }
 
-    console.log(`📦 Railway Volume mount path: ${railwayVolumePath}`);
-
-    if (!fs.existsSync(railwayVolumePath)) {
-        console.error(`❌ Railway Volume mount directory does not exist: ${railwayVolumePath}`);
-        console.error("❌ The bot will NOT start.");
-        return false;
-    }
-
     if (!isActualMountPoint(railwayVolumePath)) {
-        console.error(`❌ ${railwayVolumePath} exists, but it is NOT detected as an active mount point.`);
-        console.error("❌ The bot will NOT start to protect clansXP.json from being written outside the Volume.");
+        console.error(`❌ ${railwayVolumePath} exists, but it is NOT detected as an active Railway Volume mount.`);
+        console.error("❌ Check Railway → Service → Volumes and make sure the Volume is attached to this service with Mount Path /app/data.");
+        console.error("❌ The bot will NOT start to prevent saving XP on ephemeral storage.");
         return false;
     }
 
