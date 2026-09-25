@@ -12,7 +12,8 @@ const {
     TextInputStyle,
     AttachmentBuilder,
     UserSelectMenuBuilder,
-    StringSelectMenuBuilder
+    StringSelectMenuBuilder,
+    MessageFlags
 } = require("discord.js");
 
 const express = require("express");
@@ -67,27 +68,202 @@ function getCurrentClans() {
 }
 
 // ================= CLAN XP STORAGE SYSTEM =================
-const clansXPPath = path.join(__dirname, "clansXP.json");
+// Railway Volume: يحفظ البيانات داخل المسار الذي توفره Railway تلقائياً.
+// محلياً: نستعمل ./data كـ fallback.
+const volumeMountPath = process.env.RAILWAY_VOLUME_MOUNT_PATH || path.join(__dirname, "data");
+const xpStorageDir = volumeMountPath;
+const clansXPPath = path.join(xpStorageDir, "clansXP.json");
+const clansXPBackupPath = path.join(xpStorageDir, "clansXP.json.bak");
+
+function decodeMountInfoPath(value) {
+    return value
+        .replace(/\\040/g, " ")
+        .replace(/\\011/g, "\t")
+        .replace(/\\012/g, "\n")
+        .replace(/\\134/g, "\\");
+}
+
+function isActualMountPoint(mountPath) {
+    if (process.platform !== "linux") return false;
+
+    try {
+        const mountInfo = fs.readFileSync("/proc/self/mountinfo", "utf8");
+        const wanted = path.resolve(mountPath);
+
+        return mountInfo.split("\n").some(line => {
+            const separatorIndex = line.indexOf(" - ");
+            if (separatorIndex === -1) return false;
+
+            const leftSide = line.slice(0, separatorIndex).split(" ");
+            if (leftSide.length < 5) return false;
+
+            const mountPoint = decodeMountInfoPath(leftSide[4]);
+            return path.resolve(mountPoint) === wanted;
+        });
+    } catch (e) {
+        console.error("⚠️ Could not inspect /proc/self/mountinfo:", e.message);
+        return false;
+    }
+}
+
+function verifyXPVolumeBeforeBotStart() {
+    const railwayVolumePath = process.env.RAILWAY_VOLUME_MOUNT_PATH;
+    const isRailwayRuntime = Boolean(
+        process.env.RAILWAY_PROJECT_ID ||
+        process.env.RAILWAY_SERVICE_ID ||
+        process.env.RAILWAY_DEPLOYMENT_ID ||
+        process.env.RAILWAY_VOLUME_NAME ||
+        railwayVolumePath
+    );
+
+    console.log("==================================================");
+    console.log("📦 Clan XP Storage Startup Check");
+    console.log(`📄 clansXP.json path: ${clansXPPath}`);
+
+    if (!isRailwayRuntime) {
+        console.log("ℹ️ Railway runtime not detected. Local fallback storage is allowed.");
+        console.log(`📁 Local XP storage directory: ${xpStorageDir}`);
+        console.log("==================================================");
+        return true;
+    }
+
+    if (!railwayVolumePath) {
+        console.error("❌ Railway runtime detected, but RAILWAY_VOLUME_MOUNT_PATH is missing.");
+        console.error("❌ The bot will NOT start to prevent saving XP on ephemeral storage.");
+        return false;
+    }
+
+    console.log(`📦 Railway Volume mount path: ${railwayVolumePath}`);
+
+    if (!fs.existsSync(railwayVolumePath)) {
+        console.error(`❌ Railway Volume mount directory does not exist: ${railwayVolumePath}`);
+        console.error("❌ The bot will NOT start.");
+        return false;
+    }
+
+    if (!isActualMountPoint(railwayVolumePath)) {
+        console.error(`❌ ${railwayVolumePath} exists, but it is NOT detected as an active mount point.`);
+        console.error("❌ The bot will NOT start to protect clansXP.json from being written outside the Volume.");
+        return false;
+    }
+
+    try {
+        const testFile = path.join(railwayVolumePath, `.xp-volume-check-${process.pid}.tmp`);
+        fs.writeFileSync(testFile, "ok", "utf8");
+        fs.unlinkSync(testFile);
+    } catch (e) {
+        console.error(`❌ Railway Volume is mounted but not writable: ${railwayVolumePath}`);
+        console.error(`❌ ${e.message}`);
+        console.error("❌ The bot will NOT start.");
+        return false;
+    }
+
+    console.log("✅ Railway Volume detected and mounted successfully.");
+    console.log("✅ Railway Volume is writable.");
+    console.log(`✅ XP data will be stored at: ${clansXPPath}`);
+    console.log("==================================================");
+    return true;
+}
+
+function ensureXPStorageDir() {
+    try {
+        fs.mkdirSync(xpStorageDir, { recursive: true });
+    } catch (e) {
+        console.error("Error creating XP storage directory:", e);
+        throw e;
+    }
+}
+
+// ترحيل نسخة قديمة موجودة داخل المشروع إلى الـVolume عند أول تشغيل.
+function migrateLegacyXPFile() {
+    ensureXPStorageDir();
+
+    const legacyPath = path.join(__dirname, "clansXP.json");
+    const volumeHasMain = fs.existsSync(clansXPPath);
+
+    if (!volumeHasMain && fs.existsSync(legacyPath) && path.resolve(legacyPath) !== path.resolve(clansXPPath)) {
+        try {
+            fs.copyFileSync(legacyPath, clansXPPath);
+            console.log(`✅ Migrated legacy clansXP.json to ${clansXPPath}`);
+        } catch (e) {
+            console.error("Error migrating legacy clansXP.json:", e);
+        }
+    }
+}
+
+function parseXPFile(file) {
+    try {
+        if (!fs.existsSync(file)) return null;
+        const raw = fs.readFileSync(file, "utf-8");
+        if (!raw.trim()) return null;
+        const parsed = JSON.parse(raw);
+        if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null;
+        return parsed;
+    } catch (e) {
+        return null;
+    }
+}
+
+function restoreXPBackup() {
+    const backupData = parseXPFile(clansXPBackupPath);
+
+    if (!backupData) {
+        console.error("❌ clansXP.json is corrupted and no valid backup was found.");
+        return null;
+    }
+
+    try {
+        fs.copyFileSync(clansXPBackupPath, clansXPPath);
+        console.log("♻️ Restored clansXP.json from backup.");
+        return backupData;
+    } catch (e) {
+        console.error("Error restoring clansXP.json backup:", e);
+        return backupData;
+    }
+}
 
 function saveXPData(data) {
+    ensureXPStorageDir();
+
     try {
-        fs.writeFileSync(clansXPPath, JSON.stringify(data, null, 4), "utf-8");
+        // قبل كل عملية حفظ: خذ نسخة من الملف الرئيسي السليم إلى الـbackup.
+        if (fs.existsSync(clansXPPath)) {
+            const currentData = parseXPFile(clansXPPath);
+            if (currentData) {
+                fs.copyFileSync(clansXPPath, clansXPBackupPath);
+            } else {
+                console.warn("⚠️ Current clansXP.json is invalid; keeping the existing backup unchanged.");
+            }
+        }
+
+        // حفظ ذري: نكتب إلى ملف مؤقت ثم نستبدل الملف الرئيسي.
+        const tempPath = `${clansXPPath}.tmp`;
+        fs.writeFileSync(tempPath, JSON.stringify(data, null, 4), "utf-8");
+        fs.renameSync(tempPath, clansXPPath);
     } catch (e) {
         console.error("Error saving clansXP.json:", e);
+
+        // تنظيف الملف المؤقت إن بقي بعد فشل الحفظ.
+        try {
+            const tempPath = `${clansXPPath}.tmp`;
+            if (fs.existsSync(tempPath)) fs.unlinkSync(tempPath);
+        } catch (_) {}
     }
 }
 
 function loadXPData() {
-    const clans = getCurrentClans();
-    let data = {};
+    migrateLegacyXPFile();
 
-    if (fs.existsSync(clansXPPath)) {
-        try {
-            data = JSON.parse(fs.readFileSync(clansXPPath, "utf-8"));
-        } catch (e) {
-            console.error("Error reading clansXP.json:", e);
-            data = {};
-        }
+    const clans = getCurrentClans();
+    let data = parseXPFile(clansXPPath);
+
+    // إذا كان الملف الرئيسي تالفاً، استرجع آخر نسخة احتياطية سليمة.
+    if (!data && fs.existsSync(clansXPPath)) {
+        data = restoreXPBackup();
+    }
+
+    if (!data) {
+        data = {};
     }
 
     let hasChanges = false;
@@ -567,7 +743,7 @@ client.on("interactionCreate", async interaction => {
     try {
         // طرد عضو من الكلان
         if (interaction.isUserSelectMenu() && interaction.customId.startsWith("kick_clan_member_")) {
-            await interaction.deferReply({ ephemeral: true }).catch(() => {});
+            await interaction.deferReply({ flags: MessageFlags.Ephemeral }).catch(() => {});
 
             const clanKey = interaction.customId.replace("kick_clan_member_", "");
             const clans = getCurrentClans();
@@ -608,7 +784,7 @@ client.on("interactionCreate", async interaction => {
 
         // حذف الكلان
         if (interaction.isStringSelectMenu() && interaction.customId === "admin_delete_clan_select") {
-            await interaction.deferReply({ ephemeral: true }).catch(() => {});
+            await interaction.deferReply({ flags: MessageFlags.Ephemeral }).catch(() => {});
             
             if (!interaction.member.permissions.has("Administrator")) {
                 return interaction.editReply("❌ ليس لديك صلاحية تنفيذ هذا الإجراء.").catch(() => {});
@@ -638,7 +814,7 @@ client.on("interactionCreate", async interaction => {
             if (Date.now() - joinedAt.getTime() < fifteenDaysInMs) {
                 return interaction.reply({
                     content: "❌ يجب أن تكون قد أمضيت 15 يوماً على الأقل في السيرفر لكي تتمكن من تأسيس كلان.",
-                    ephemeral: true
+                    flags: MessageFlags.Ephemeral
                 }).catch(() => {});
             }
 
@@ -668,7 +844,7 @@ client.on("interactionCreate", async interaction => {
 
         // 2. معالجة الـ Modal المبدئي للتأسيس
         if (interaction.isModalSubmit() && interaction.customId === "clan_creation_modal") {
-            await interaction.deferReply({ ephemeral: true }).catch(() => {});
+            await interaction.deferReply({ flags: MessageFlags.Ephemeral }).catch(() => {});
 
             const clanName = interaction.fields.getTextInputValue("proposed_name");
             const clanDesc = interaction.fields.getTextInputValue("proposed_desc");
@@ -705,17 +881,17 @@ client.on("interactionCreate", async interaction => {
             const leaderId = interaction.customId.split("_")[2];
             
             if (interaction.user.id !== leaderId) {
-                return interaction.followUp({ content: "❌ القائد فقط هو المخول باختيار الأعضاء.", ephemeral: true }).catch(() => {});
+                return interaction.followUp({ content: "❌ القائد فقط هو المخول باختيار الأعضاء.", flags: MessageFlags.Ephemeral }).catch(() => {});
             }
 
             const creationData = activeCreations.get(leaderId);
             if (!creationData) {
-                return interaction.followUp({ content: "❌ انتهت مهلة الجلسة، يرجى تقديم الطلب من جديد.", ephemeral: true }).catch(() => {});
+                return interaction.followUp({ content: "❌ انتهت مهلة الجلسة، يرجى تقديم الطلب من جديد.", flags: MessageFlags.Ephemeral }).catch(() => {});
             }
 
             const selectedUsers = Array.from(interaction.values);
             if (selectedUsers.includes(leaderId)) {
-                return interaction.followUp({ content: "❌ لا يمكنك دعوة نفسك! اختر 7 أعضاء آخرين.", ephemeral: true }).catch(() => {});
+                return interaction.followUp({ content: "❌ لا يمكنك دعوة نفسك! اختر 7 أعضاء آخرين.", flags: MessageFlags.Ephemeral }).catch(() => {});
             }
 
             creationData.invitedUsers = selectedUsers;
@@ -760,7 +936,7 @@ client.on("interactionCreate", async interaction => {
 
             const creationData = activeCreations.get(leaderId);
             if (!creationData) {
-                return interaction.followUp({ content: "❌ هذا الطلب ملغى أو انتهت صلاحيته.", ephemeral: true }).catch(() => {});
+                return interaction.followUp({ content: "❌ هذا الطلب ملغى أو انتهت صلاحيته.", flags: MessageFlags.Ephemeral }).catch(() => {});
             }
 
             if (!creationData.acceptedUsers.includes(memberId)) {
@@ -808,7 +984,7 @@ ${creationData.acceptedUsers.filter(id => id !== leaderId).map(id => `• <@${id
             const creationData = activeCreations.get(leaderId);
 
             if (!creationData) {
-                return interaction.followUp({ content: "❌ تعذر العثور على بيانات التأسيس المبدئية.", ephemeral: true }).catch(() => {});
+                return interaction.followUp({ content: "❌ تعذر العثور على بيانات التأسيس المبدئية.", flags: MessageFlags.Ephemeral }).catch(() => {});
             }
 
             const guild = interaction.guild;
@@ -851,7 +1027,7 @@ ${creationData.acceptedUsers.filter(id => id !== leaderId).map(id => `• <@${id
             const clans = getCurrentClans();
             const clan = clans[clanKey];
 
-            if (!clan) return interaction.reply({ content: "❌ الكلان غير متواجد حالياً في النظام.", ephemeral: true }).catch(() => {});
+            if (!clan) return interaction.reply({ content: "❌ الكلان غير متواجد حالياً في النظام.", flags: MessageFlags.Ephemeral }).catch(() => {});
 
             const modal = new ModalBuilder()
                 .setCustomId(`modal_${clanKey}`)
@@ -877,26 +1053,26 @@ ${creationData.acceptedUsers.filter(id => id !== leaderId).map(id => `• <@${id
             const match = interaction.customId.match(/^accept_(\d+)_(\d+)_(clan_\d+|c_\d+)$/);
             
             if (!match) {
-                return interaction.followUp({ content: "❌ Invalid button payload format.", ephemeral: true }).catch(() => {});
+                return interaction.followUp({ content: "❌ Invalid button payload format.", flags: MessageFlags.Ephemeral }).catch(() => {});
             }
 
             const [, guildID, userID, clanKey] = match;
 
             const guild = client.guilds.cache.get(guildID) || await client.guilds.fetch(guildID).catch(() => null);
-            if (!guild) return interaction.followUp({ content: "❌ Server not found", ephemeral: true }).catch(() => {});
+            if (!guild) return interaction.followUp({ content: "❌ Server not found", flags: MessageFlags.Ephemeral }).catch(() => {});
 
             const member = await guild.members.fetch(userID).catch(() => null);
-            if (!member) return interaction.followUp({ content: "❌ Member not found in server", ephemeral: true }).catch(() => {});
+            if (!member) return interaction.followUp({ content: "❌ Member not found in server", flags: MessageFlags.Ephemeral }).catch(() => {});
 
             const clans = getCurrentClans();
             const clan = clans[clanKey];
             
             if (!clan) {
-                return interaction.followUp({ content: "❌ Clan config not found in database.", ephemeral: true }).catch(() => {});
+                return interaction.followUp({ content: "❌ Clan config not found in database.", flags: MessageFlags.Ephemeral }).catch(() => {});
             }
 
             const clanRole = guild.roles.cache.get(clan.roleID) || await guild.roles.fetch(clan.roleID).catch(() => null);
-            if (!clanRole) return interaction.followUp({ content: "❌ Clan role not found on server", ephemeral: true }).catch(() => {});
+            if (!clanRole) return interaction.followUp({ content: "❌ Clan role not found on server", flags: MessageFlags.Ephemeral }).catch(() => {});
 
             await member.roles.add(clanRole.id).catch(err => console.error("Error adding role:", err));
             await member.send(`🎉 تم قبولك في كلان **${clan.name}**!`).catch(() => {});
@@ -914,7 +1090,7 @@ ${creationData.acceptedUsers.filter(id => id !== leaderId).map(id => `• <@${id
             const match = interaction.customId.match(/^reject_(\d+)_(\d+)_(clan_\d+|c_\d+)$/);
             
             if (!match) {
-                return interaction.followUp({ content: "❌ Invalid button payload format.", ephemeral: true }).catch(() => {});
+                return interaction.followUp({ content: "❌ Invalid button payload format.", flags: MessageFlags.Ephemeral }).catch(() => {});
             }
 
             const [, , userID, clanKey] = match;
@@ -933,7 +1109,7 @@ ${creationData.acceptedUsers.filter(id => id !== leaderId).map(id => `• <@${id
 
         // ===== MODAL SUBMIT (إرسال التقديم لليدر) =====
         if (interaction.isModalSubmit() && interaction.customId.startsWith("modal_")) {
-            await interaction.deferReply({ ephemeral: true }).catch(() => {});
+            await interaction.deferReply({ flags: MessageFlags.Ephemeral }).catch(() => {});
             const clanKey = interaction.customId.replace("modal_", "");
             const clans = getCurrentClans();
             const clan = clans[clanKey];
@@ -993,5 +1169,9 @@ ${creationData.acceptedUsers.filter(id => id !== leaderId).map(id => `• <@${id
         console.log("Error in interactionCreate event:", err);
     }
 });
+
+if (!verifyXPVolumeBeforeBotStart()) {
+    process.exit(1);
+}
 
 client.login(process.env.DISCORD_TOKEN);
