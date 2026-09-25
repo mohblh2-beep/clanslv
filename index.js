@@ -739,6 +739,198 @@ ${clansDescription}
             components: [row]
         });
     }
+
+    // ================= CLAN XP COMMANDS =================
+
+    // *topclans - عرض ترتيب الكلانات حسب XP
+    if (command === "*topclans") {
+        const data = loadXPData();
+        const currentClans = getCurrentClans();
+        const clans = Object.entries(currentClans)
+            .map(([key, clan]) => ({
+                key,
+                name: clan.name,
+                xp: data[key]?.xp || 0
+            }))
+            .sort((a, b) => b.xp - a.xp);
+
+        if (clans.length === 0) {
+            return message.reply("❌ لا يوجد أي كلانات مسجلة حالياً.");
+        }
+
+        const baseMedals = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣", "🔟"];
+        const embed = new EmbedBuilder()
+            .setTitle("🏆 Clan Ranking")
+            .setColor("#8A2BE2")
+            .setTimestamp();
+
+        clans.forEach((clan, index) => {
+            const medalIcon = baseMedals[index] || `**#${index + 1}**`;
+            embed.addFields({
+                name: `${medalIcon} ${clan.name}`,
+                value: `${clan.xp} XP`,
+                inline: false
+            });
+        });
+
+        return message.reply({ embeds: [embed] }).catch(() => {});
+    }
+
+    // *clanxp - عرض XP الكلان الذي ينتمي إليه العضو
+    if (command === "*clanxp") {
+        const currentClans = getCurrentClans();
+        let clanKey = null;
+
+        for (const [key, clan] of Object.entries(currentClans)) {
+            if (message.member.roles.cache.has(clan.roleID)) {
+                clanKey = key;
+                break;
+            }
+        }
+
+        if (!clanKey) {
+            return message.reply("❌ أنت لا تنتمي لأي كلان.");
+        }
+
+        const data = loadXPData();
+        const sorted = Object.entries(currentClans)
+            .map(([key]) => ({
+                key,
+                xp: data[key]?.xp || 0
+            }))
+            .sort((a, b) => b.xp - a.xp);
+
+        const rank = sorted.findIndex(c => c.key === clanKey) + 1;
+
+        return message.reply({
+            embeds: [
+                new EmbedBuilder()
+                    .setColor("#8A2BE2")
+                    .setTitle(currentClans[clanKey].name)
+                    .addFields(
+                        {
+                            name: "⭐ XP",
+                            value: String(data[clanKey]?.xp || 0),
+                            inline: true
+                        },
+                        {
+                            name: "🏆 Rank",
+                            value: rank > 0 ? `#${rank}` : "غير مصنف",
+                            inline: true
+                        }
+                    )
+                    .setTimestamp()
+            ]
+        }).catch(() => {});
+    }
+
+    // *deleteclan <key|name|roleID|leaderRoleID> - حذف كلان للإدارة
+    if (command.startsWith("*deleteclan")) {
+        if (!message.member.permissions.has("Administrator")) {
+            return message.reply("❌ هذا الأمر مخصص للإدارة فقط.");
+        }
+
+        const args = message.content.split(" ").slice(1);
+        const targetInput = args.join(" ").trim().toLowerCase();
+
+        if (!targetInput) {
+            return message.reply("⚠️ اكتب اسم الكلان أو الـ Key أو آيدي رول الكلان.\nمثال: `*deleteclan clan_123`");
+        }
+
+        const currentClans = getCurrentClans();
+        let foundKey = null;
+
+        for (const [key, clan] of Object.entries(currentClans)) {
+            if (
+                key.toLowerCase() === targetInput ||
+                String(clan.name || "").toLowerCase() === targetInput ||
+                String(clan.roleID || "") === targetInput ||
+                String(clan.leaderRoleID || "") === targetInput
+            ) {
+                foundKey = key;
+                break;
+            }
+        }
+
+        if (!foundKey) {
+            return message.reply(`❌ لم يتم العثور على أي كلان بالمُعرّف: \`${targetInput}\``);
+        }
+
+        const clanData = currentClans[foundKey];
+
+        try {
+            if (clanData.roleID) {
+                const role = await message.guild.roles.fetch(clanData.roleID).catch(() => null);
+                if (role) await role.delete().catch(() => {});
+            }
+
+            if (clanData.leaderRoleID) {
+                const leaderRole = await message.guild.roles.fetch(clanData.leaderRoleID).catch(() => null);
+                if (leaderRole) await leaderRole.delete().catch(() => {});
+            }
+        } catch (err) {
+            console.error("Error deleting clan roles:", err);
+        }
+
+        let success = false;
+        if (typeof config.deleteClan === "function") {
+            success = config.deleteClan(foundKey);
+        }
+
+        const data = loadXPData();
+        delete data[foundKey];
+        saveXPData(data);
+
+        if (success) {
+            return message.reply(`✅ تم حذف كلان **${clanData.name}** وإزالة رتبته وسجل XP الخاص به.`);
+        }
+
+        return message.reply("⚠️ تم حذف سجل XP والرتب إن أمكن، لكن تعذر حذف الكلان من config.");
+    }
+
+    // *resetxp - تصفير XP لجميع الكلانات
+    if (command === "*resetxp") {
+        if (!message.member.permissions.has("Administrator")) {
+            return message.reply("❌ Administrator Only.");
+        }
+
+        const currentClans = getCurrentClans();
+        const data = {};
+
+        Object.keys(currentClans).forEach(key => {
+            data[key] = {
+                xp: 0,
+                dailyXp: 0,
+                lastActive: Date.now()
+            };
+        });
+
+        saveXPData(data);
+        return message.reply("✅ Clan XP Reset.");
+    }
+
+    // *setupboard - إنشاء لوحة الصدارة وحفظ رسالتها
+    if (command === "*setupboard") {
+        if (!message.member.permissions.has("Administrator")) {
+            return message.reply("❌ Administrator Only.");
+        }
+
+        const embed = new EmbedBuilder()
+            .setColor("#8A2BE2")
+            .setDescription("⏳ Loading Clan Leaderboard...")
+            .setTimestamp();
+
+        leaderboardMessage = await message.channel.send({
+            embeds: [embed]
+        }).catch(() => null);
+
+        if (!leaderboardMessage) {
+            return message.reply("❌ تعذر إنشاء لوحة الصدارة.");
+        }
+
+        return message.reply("✅ Leaderboard Created.").catch(() => {});
+    }
+
 });
 
 // ================= INTERACTIONS HANDLER =================
